@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: livegrambot-clone
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_GROUP_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: BOT_NAME
+        value: Livegram Support
+      - key: WELCOME_MESSAGE
+        value: Welcome! Send your message here to contact support.
+      - key: LOG_LEVEL
+        value: INFO
