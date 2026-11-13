@@ -23,7 +23,7 @@ from aiogram.exceptions import (
     TelegramAPIError,
     TelegramRetryAfter,
 )
-from aiogram.types import BotCommand, Message, ReplyParameters
+from aiogram.types import BotCommand, Message, ReplyParameters, ReactionTypeEmoji
 from dotenv import load_dotenv
 
 # Load local .env files when present. Render injects Environment variables directly.
@@ -166,6 +166,11 @@ def _metadata_notice_text(message: Message, *, route_only: bool, detail: str = "
         f"👤 <b>Name:</b> {name}",
         f"🔖 <b>Username:</b> {username}",
         f"🆔 <b>User ID:</b> <code>{user.id}</code>",
+        f"🌐 <b>Language:</b> {html.escape(user.language_code or 'Unknown')}",
+        f"⭐ <b>Premium:</b> {'Yes' if user.is_premium else 'No'}",
+        f"🤖 <b>Bot account:</b> {'Yes' if user.is_bot else 'No'}",
+        f"💬 <b>Chat ID:</b> <code>{message.chat.id}</code>",
+        f"🕒 <b>Message ID:</b> <code>{message.message_id}</code>",
         f"<code>SUPPORT_USER_ID={user.id}</code>",
     ]
 
@@ -191,10 +196,11 @@ async def post_admin_notice(
     reply_to_message_id: int | None = None,
     route_only: bool = False,
     detail: str = "",
+    chat_id: int = ADMIN_GROUP_ID,
 ) -> None:
     """Post a bot-authored, restart-safe reply anchor containing the user ID."""
     kwargs: dict[str, Any] = {
-        "chat_id": ADMIN_GROUP_ID,
+        "chat_id": chat_id,
         "text": _metadata_notice_text(message, route_only=route_only, detail=detail),
         "parse_mode": ParseMode.HTML,
         "disable_web_page_preview": True,
@@ -214,6 +220,60 @@ async def acknowledge_user(message: Message, text: str) -> None:
         log.info("Could not send user acknowledgement for chat %s", message.chat.id)
 
 
+async def add_reaction(chat_id: int, message_id: int, emoji: str) -> None:
+    """Best-effort Telegram reaction; failures never stop message delivery."""
+    try:
+        await telegram_call(
+            lambda: bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+                is_big=False,
+            )
+        )
+    except TelegramAPIError as exc:
+        log.debug("Reaction %s failed for %s/%s: %s", emoji, chat_id, message_id, exc)
+
+
+async def notify_admin_private(message: Message) -> None:
+    """Send the user's message to each admin with a stateless reply route."""
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.forward_origin is None:
+                # Preserve the sender's Telegram user ID in forward_origin.
+                delivered = await telegram_call(
+                    lambda admin_id=admin_id: bot.forward_message(
+                        chat_id=admin_id,
+                        from_chat_id=message.chat.id,
+                        message_id=message.message_id,
+                    )
+                )
+                anchor_id = delivered.message_id
+                route_only = False
+            else:
+                # A customer-submitted forward identifies its original author,
+                # not the customer contacting support. Copy it and use our notice.
+                copied = await telegram_call(
+                    lambda admin_id=admin_id: bot.copy_message(
+                        chat_id=admin_id,
+                        from_chat_id=message.chat.id,
+                        message_id=message.message_id,
+                    )
+                )
+                anchor_id = copied.message_id
+                route_only = True
+
+            await post_admin_notice(
+                message,
+                reply_to_message_id=anchor_id,
+                route_only=route_only,
+                chat_id=admin_id,
+                detail="Reply to this notice if the forwarded/copy item does not identify the customer.",
+            )
+        except TelegramAPIError as exc:
+            log.warning("Could not deliver private admin notification to %s: %s", admin_id, exc)
+
+
 async def try_copy_incoming(message: Message) -> int | None:
     """Copy content when forwarding would expose an unrelated forward origin."""
     try:
@@ -231,7 +291,9 @@ async def try_copy_incoming(message: Message) -> int | None:
 
 
 async def relay_single_user_message(message: Message) -> None:
-    """Relay one private message and add a stateless reply anchor."""
+    """Relay one private message to the group and admins' private inboxes."""
+    await add_reaction(message.chat.id, message.message_id, "🫡")
+    await notify_admin_private(message)
     user_sent_a_forward = message.forward_origin is not None
 
     if user_sent_a_forward:
@@ -320,6 +382,9 @@ async def relay_album(messages: list[Message]) -> None:
         return
     messages.sort(key=lambda item: item.message_id)
     first = messages[0]
+    for item in messages:
+        await add_reaction(item.chat.id, item.message_id, "🫡")
+        await notify_admin_private(item)
     ids = [item.message_id for item in messages]
     user_sent_forward = any(item.forward_origin is not None for item in messages)
 
@@ -486,18 +551,18 @@ def resolve_user_id_from_admin_reply(reply_to: Message) -> int | None:
     if BOT_USER_ID is None:
         return None
 
-    # Never trust arbitrary user-authored forwarded messages in the admin group.
-    if reply_to.from_user is None or reply_to.from_user.id != BOT_USER_ID:
-        return None
-
+    # A normal support forward retains the customer's user ID as its origin.
     origin = reply_to.forward_origin
     if origin is not None and getattr(origin, "type", None) == "user":
         sender = getattr(origin, "sender_user", None)
         if sender is not None and sender.id > 0:
             return sender.id
 
-    # Fallback for copied items, hidden forward origins, and unsupported types.
-    # The message must be authored by this bot; users cannot forge this anchor.
+    # Fallback anchors are trusted only when authored by this bot.
+    if reply_to.from_user is None or reply_to.from_user.id != BOT_USER_ID:
+        return None
+
+    # Copied items, hidden forward origins, and unsupported message types.
     text = reply_to.text or reply_to.caption or ""
     match = _TARGET_MARKER_RE.search(text)
     if match:
@@ -513,7 +578,7 @@ async def deliver_admin_reply(message: Message, target_user_id: int) -> bool:
         await telegram_call(
             lambda: bot.copy_message(
                 chat_id=target_user_id,
-                from_chat_id=ADMIN_GROUP_ID,
+                from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
         )
@@ -525,7 +590,7 @@ async def deliver_admin_reply(message: Message, target_user_id: int) -> bool:
         await telegram_call(
             lambda: bot.forward_message(
                 chat_id=target_user_id,
-                from_chat_id=ADMIN_GROUP_ID,
+                from_chat_id=message.chat.id,
                 message_id=message.message_id,
             )
         )
@@ -544,7 +609,7 @@ async def admin_feedback(message: Message, text: str) -> None:
     try:
         await telegram_call(
             lambda: bot.send_message(
-                chat_id=ADMIN_GROUP_ID,
+                chat_id=message.chat.id,
                 text=text,
                 parse_mode=ParseMode.HTML,
                 reply_parameters=ReplyParameters(
@@ -564,6 +629,7 @@ async def admin_feedback(message: Message, text: str) -> None:
 
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def start_command(message: Message) -> None:
+    await add_reaction(message.chat.id, message.message_id, "🥳")
     await message.answer(WELCOME_MESSAGE)
 
 
@@ -675,9 +741,33 @@ async def user_command(message: Message) -> None:
 # ---------------------------------------------------------------------------
 
 
+@router.message(F.chat.type == ChatType.PRIVATE, F.reply_to_message)
+async def admin_private_reply(message: Message) -> None:
+    """Configured admins can reply to the bot-authored private user-info notice."""
+    if message.from_user is None or message.from_user.id not in ADMIN_IDS:
+        return
+    if message.text and message.text.startswith("/"):
+        return
+
+    target_user_id = resolve_user_id_from_admin_reply(message.reply_to_message)
+    if target_user_id is None or target_user_id in ADMIN_IDS:
+        return
+
+    await add_reaction(message.chat.id, message.message_id, "🌚")
+    await add_reaction(message.chat.id, message.message_id, "🌚")
+    delivered = await deliver_admin_reply(message, target_user_id)
+    if delivered:
+        await admin_feedback(message, f"✅ Reply delivered to user <code>{target_user_id}</code>.")
+    else:
+        await admin_feedback(message, f"❌ Delivery failed for user <code>{target_user_id}</code>.")
+
+
 @router.message(F.chat.type == ChatType.PRIVATE)
 async def incoming_private_message(message: Message) -> None:
     if message.from_user is None:
+        return
+    # Admins' own messages must never be relayed as customer messages.
+    if message.from_user.id in ADMIN_IDS:
         return
 
     if message.media_group_id:
